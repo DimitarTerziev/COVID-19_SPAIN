@@ -1,5 +1,4 @@
-# COVID-19_SPAIN
-Overdispersion of COVID-19 transmission in Spain.
+# Overdispersion of COVID-19 transmission in Spain.
 
 Supplementary materials for the Master Thesis "Overdispersion of COVID-19 transmission in Spain", by Dimitar Aleksandrov Terziev. Supervisor: Ana Arribas Gil. Universidad Carlos III de Madrid (UC3M).
 
