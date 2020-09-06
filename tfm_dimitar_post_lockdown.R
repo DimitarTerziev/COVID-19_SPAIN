@@ -1,0 +1,1115 @@
+# TFM Dimitar: post-lockdown
+
+rm(list=ls())
+setwd("C:/Users/PC/Documents/Statistics for Data Science/TFM")
+data = read.csv("datos_ccaas.csv")
+
+
+#We have used "R0" in our functions, but we are always referring to "Reff" ...
+##...(except for the last section of the code: "Initial phase of COVID-19 pandemic)
+
+
+
+# Cluster size inference --------------------------------------------------
+
+# for extinct clusters
+library(VGAM)
+library(matrixStats)
+llextinct<-function(icases,lcases,R0,k,importcontrol=F){
+  if(importcontrol){# For Sensitivity: different R0 for imported cases
+    return(llextinct_importcontrol(icases,lcases,R0,k))
+  }
+  if(length(icases)==0)return(0)
+  tcases=lcases+icases
+  lls=log(k)+log(icases)-log((k+1)*tcases-icases)+lchoose((k+1)*tcases-icases,tcases-icases)+(tcases-icases)*(log(R0)-log(k))-((k+1)*tcases-icases)*log(1+R0/k)
+  sum(lls,na.rm=T)
+}
+
+
+# only use the number as the lower bound of cluster size for ongoing countries
+lltruncate<-function(icases,lcases,R0,k,importcontrol=F){
+  if(length(icases)==0) return(0)
+  ll=0
+  for(i in 1:length(icases)){
+    lprob=0
+    if(icases[i]==0||lcases[i]==0)next
+    for(x in 0:(lcases[i]-1)){
+      lle=llextinct(icases[i],x,R0,k,importcontrol)
+      if(lprob<lle){
+        lprob=-Inf
+        break
+      }
+      lprob=lprob+log1mexp(-(lle-lprob))
+    }
+    if(!is.nan(lprob))ll=ll+lprob
+  }
+  return(ll)
+}
+lltotal<-function(R0invk,icases,lcases,isextinct,importcontrol=F){
+  R0=R0invk[1];k=1/R0invk[2]
+  llextinct(icases[isextinct],lcases[isextinct],R0,k,importcontrol)+lltruncate(icases[!isextinct],lcases[!isextinct],R0,k,importcontrol)
+}
+lltotal_R0<-function(invk,icases,lcases,isextinct,R0,importcontrol=F){
+  k=1/invk
+  llextinct(icases[isextinct],lcases[isextinct],R0,k,importcontrol)+lltruncate(icases[!isextinct],lcases[!isextinct],R0,k,importcontrol)
+}
+
+# Proportion responsible for 80% of secondary transmission ----------------
+propresponsible=function(R0,k,prop){
+  qm1=qnbinom(1-prop,k+1,mu=R0*(k+1)/k)
+  remq=1-prop-pnbinom(qm1-1,k+1,mu=R0*(k+1)/k)
+  remx=remq/dnbinom(qm1,k+1,mu=R0*(k+1)/k)
+  q=qm1+1
+  1-pnbinom(q-1,k,mu=R0)-dnbinom(q,k,mu=R0)*remx
+}
+
+
+
+
+
+
+# ANDALUSIA ---------------------------------------------------------------
+
+data_AN = data[which(data$ccaa_iso == "AN"),]
+data_AN = data_AN[1:which(data_AN$fecha == "2020-07-23"),]
+
+andalusia_22_june = sum(data_AN$num_casos_prueba_pcr[1:which(data_AN$fecha == "2020-06-23")])
+andalusia_9_june = sum(data_AN$num_casos_prueba_pcr[1:which(data_AN$fecha == "2020-06-09")])
+andalusia_22_july = sum(data_AN$num_casos_prueba_pcr[1:which(data_AN$fecha == "2020-07-23")])
+
+andalusia_july = data.frame(matrix(ncol = 3, nrow = 32))
+colnames(andalusia_july) = c("num_cases", "primary", "secondary")
+
+andalusia_july$num_cases = as.integer(c(10,5,4,4,4,5,7,5,78,5,6,31,
+                                             4,13,39,5,16,5,61,6,6,9,8,5,
+                                             8,7,6,18,109,29,7,26))
+
+andalusia_no_outbreaks = andalusia_22_july - andalusia_22_june - sum(andalusia_july$num_cases)
+andalusia_lockdown = andalusia_22_june - andalusia_9_june
+andalusia_july$primary = as.integer(c(1,4,4,4,1,5,7,5,10,5,1,31,4,9,
+                                           12,5,10,5,1,3,6,5,5,5,7,5,5,5,
+                                           1,11,1,3))
+andalusia_july$secondary = andalusia_july$num_cases - andalusia_july$primary
+andalusia_july[33,1] = andalusia_no_outbreaks + andalusia_lockdown
+andalusia_july[33,2] = andalusia_lockdown
+andalusia_july[33,3] = andalusia_no_outbreaks
+
+
+
+isextinct=logical(length(andalusia_july$num_cases))
+isextinct[-c(6,33)] = TRUE
+icases=andalusia_july$primary
+lcases=andalusia_july$secondary
+
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+library(LaplacesDemon)
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.2),type="l",xlab="Reff",ylab="k", main="Andalusia")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.2),type="l",xlab="Reff",ylab="p80%", main="Andalusia")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+
+# EXTREMADURA -------------------------------------------------------------
+
+data_EX = data[which(data$ccaa_iso == "EX"),]
+data_EX = data_EX[1:which(data_EX$fecha == "2020-07-23"),]
+
+extremadura_22_june = sum(data_EX$num_casos_prueba_pcr[1:which(data_EX$fecha == "2020-06-23")])
+extremadura_9_june = sum(data_EX$num_casos_prueba_pcr[1:which(data_EX$fecha == "2020-06-09")])
+extremadura_22_july = sum(data_EX$num_casos_prueba_pcr[1:which(data_EX$fecha == "2020-07-23")])
+
+extremadura_july = data.frame(matrix(ncol = 3, nrow = 8))
+colnames(extremadura_july) = c("num_cases", "primary", "secondary")
+
+extremadura_july$num_cases = as.integer(c(56,14,7,7,17,7,21,23))
+
+extremadura_no_outbreaks = extremadura_22_july - extremadura_22_june - sum(extremadura_july$num_cases)
+extremadura_lockdown = extremadura_22_june - extremadura_9_june
+extremadura_july$primary = as.integer(c(12,1,6,1,11,1,1,1))
+extremadura_july$secondary = extremadura_july$num_cases - extremadura_july$primary
+extremadura_july[9,1] = extremadura_no_outbreaks + extremadura_lockdown
+extremadura_july[9,2] = extremadura_lockdown
+extremadura_july[9,3] = extremadura_no_outbreaks
+
+
+
+isextinct=logical(length(extremadura_july$num_cases))
+isextinct[-c(1,6,7,9)] = TRUE
+icases=extremadura_july$primary
+lcases=extremadura_july$secondary
+
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1),type="l",xlab="Reff",ylab="k",main="Extremadura")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Extremadura")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+
+# LA RIOJA ----------------------------------------------------------------
+data_RI = data[which(data$ccaa_iso == "RI"),]
+data_RI = data_RI[1:which(data_RI$fecha == "2020-07-23"),]
+
+rioja_22_june = sum(data_RI$num_casos_prueba_pcr[1:which(data_RI$fecha == "2020-06-23")])
+rioja_9_june = sum(data_RI$num_casos_prueba_pcr[1:which(data_RI$fecha == "2020-06-09")])
+rioja_22_july = sum(data_RI$num_casos_prueba_pcr[1:which(data_RI$fecha == "2020-07-23")])
+
+rioja_july = data.frame(matrix(ncol = 3, nrow = 5))
+colnames(rioja_july) = c("num_cases", "primary", "secondary")
+
+rioja_july$num_cases = as.integer(c(6,3,8,5,3))
+
+rioja_no_outbreaks = rioja_22_july - rioja_22_june - sum(rioja_july$num_cases)
+rioja_lockdown = rioja_22_june - rioja_9_june
+rioja_july$primary = as.integer(c(3,3,4,3,1))
+rioja_july$secondary = rioja_july$num_cases - rioja_july$primary
+rioja_july[6,1] = rioja_no_outbreaks + rioja_lockdown
+rioja_july[6,2] = rioja_lockdown
+rioja_july[6,3] = rioja_no_outbreaks
+
+isextinct=logical(length(rioja_july$num_cases))
+isextinct[c(2,4,5)] = TRUE
+icases=rioja_july$primary
+lcases=rioja_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1.5),type="l",xlab="Reff",ylab="k",main="La Rioja")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="La Rioja")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# CANTABRIA ---------------------------------------------------------------
+data_CB = data[which(data$ccaa_iso == "CB"),]
+data_CB = data_CB[1:which(data_CB$fecha == "2020-07-23"),]
+
+cantabria_22_june = sum(data_CB$num_casos_prueba_pcr[1:which(data_CB$fecha == "2020-06-23")])
+cantabria_9_june = sum(data_CB$num_casos_prueba_pcr[1:which(data_CB$fecha == "2020-06-09")])
+cantabria_22_july = sum(data_CB$num_casos_prueba_pcr[1:which(data_CB$fecha == "2020-07-23")])
+
+cantabria_july = data.frame(matrix(ncol = 3, nrow = 4))
+colnames(cantabria_july) = c("num_cases", "primary", "secondary")
+
+cantabria_july$num_cases = as.integer(c(9,15,9,4))
+
+cantabria_no_outbreaks = cantabria_22_july - cantabria_22_june - sum(cantabria_july$num_cases)
+cantabria_lockdown = cantabria_22_june - cantabria_9_june - 3
+cantabria_july$primary = as.integer(c(9,3,3,1))
+cantabria_july$secondary = cantabria_july$num_cases - cantabria_july$primary
+cantabria_july[5,1] = cantabria_no_outbreaks + cantabria_lockdown
+cantabria_july[5,2] = cantabria_lockdown
+cantabria_july[5,3] = cantabria_no_outbreaks
+
+
+isextinct=logical(length(cantabria_july$num_cases))
+isextinct[2:4] = TRUE
+icases=cantabria_july$primary
+lcases=cantabria_july$secondary
+
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1.5),type="l",xlab="Reff",ylab="k",main="Cantabria")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Cantabria")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# BASQUE COUNTRY --------------------------------------------------------------
+data_PV = data[which(data$ccaa_iso == "PV"),]
+data_PV = data_PV[1:which(data_PV$fecha == "2020-07-23"),]
+
+basquecountry_22_june = sum(data_PV$num_casos_prueba_pcr[1:which(data_PV$fecha == "2020-06-23")])
+basquecountry_9_june = sum(data_PV$num_casos_prueba_pcr[1:which(data_PV$fecha == "2020-06-09")])
+basquecountry_22_july = sum(data_PV$num_casos_prueba_pcr[1:which(data_PV$fecha == "2020-07-23")])
+
+basquecountry_july = data.frame(matrix(ncol = 3, nrow = 5))
+colnames(basquecountry_july) = c("num_cases", "primary", "secondary")
+
+basquecountry_july$num_cases = as.integer(c(1,95,5,12,20))
+
+basquecountry_no_outbreaks = basquecountry_22_july - basquecountry_22_june - sum(basquecountry_july$num_cases)
+basquecountry_lockdown = basquecountry_22_june - basquecountry_9_june
+basquecountry_july$primary = as.integer(c(1,1,1,1,5))
+basquecountry_july$secondary = basquecountry_july$num_cases - basquecountry_july$primary
+basquecountry_july[6,1] = basquecountry_no_outbreaks + basquecountry_lockdown
+basquecountry_july[6,2] = basquecountry_lockdown
+basquecountry_july[6,3] = basquecountry_no_outbreaks
+
+
+
+isextinct=logical(length(basquecountry_july$num_cases))
+isextinct[c(1:5)] = TRUE
+icases=basquecountry_july$primary
+lcases=basquecountry_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1),type="l",xlab="Reff",ylab="k",main="Basque Country")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Basque Country")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# GALICIA -----------------------------------------------------------------
+data_GA = data[which(data$ccaa_iso == "GA"),]
+data_GA = data_GA[1:which(data_GA$fecha == "2020-07-23"),]
+
+galicia_22_june = sum(data_GA$num_casos_prueba_pcr[1:which(data_GA$fecha == "2020-06-23")])
+galicia_9_june = sum(data_GA$num_casos_prueba_pcr[1:which(data_GA$fecha == "2020-06-09")])
+galicia_22_july = sum(data_GA$num_casos_prueba_pcr[1:which(data_GA$fecha == "2020-07-23")])
+
+galicia_july = data.frame(matrix(ncol = 3, nrow = 3))
+colnames(galicia_july) = c("num_cases", "primary", "secondary")
+
+galicia_july$num_cases = as.integer(c(184,10,9))
+
+galicia_no_outbreaks = galicia_22_july - galicia_22_june - sum(galicia_july$num_cases)
+galicia_lockdown = galicia_22_june - galicia_9_june
+galicia_july$primary = as.integer(c(1,2,1))
+galicia_july$secondary = galicia_july$num_cases - galicia_july$primary
+galicia_july[4,1] = galicia_no_outbreaks + galicia_lockdown
+galicia_july[4,2] = galicia_lockdown
+galicia_july[4,3] = galicia_no_outbreaks
+
+
+isextinct=logical(length(galicia_july$num_cases))
+isextinct[c(1,3)] = TRUE
+icases=galicia_july$primary
+lcases=galicia_july$secondary
+
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1),type="l",xlab="Reff",ylab="k",main="Galicia")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Galicia")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# CASTILLA LA MANCHA ------------------------------------------------------
+data_CM = data[which(data$ccaa_iso == "CM"),]
+data_CM = data_CM[1:which(data_CM$fecha == "2020-07-23"),]
+
+cmancha_22_june = sum(data_CM$num_casos_prueba_pcr[1:which(data_CM$fecha == "2020-06-23")])
+cmancha_9_june = sum(data_CM$num_casos_prueba_pcr[1:which(data_CM$fecha == "2020-06-09")])
+cmancha_22_july = sum(data_CM$num_casos_prueba_pcr[1:which(data_CM$fecha == "2020-07-23")])
+
+cmancha_july = data.frame(matrix(ncol = 3, nrow = 5))
+colnames(cmancha_july) = c("num_cases", "primary", "secondary")
+
+cmancha_july$num_cases = as.integer(c(48,23,5,5,3))
+
+cmancha_no_outbreaks = cmancha_22_july - cmancha_22_june - sum(cmancha_july$num_cases)
+cmancha_lockdown = cmancha_22_june - cmancha_9_june
+cmancha_july$primary = as.integer(c(4,10,5,5,3))
+cmancha_july$secondary = cmancha_july$num_cases - cmancha_july$primary
+cmancha_july[6,1] = cmancha_no_outbreaks + cmancha_lockdown
+cmancha_july[6,2] = cmancha_lockdown
+cmancha_july[6,3] = cmancha_no_outbreaks
+
+
+
+isextinct=logical(length(cmancha_july$num_cases))
+isextinct[c(1,3,5)] = TRUE
+icases=cmancha_july$primary
+lcases=cmancha_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.6),type="l",xlab="Reff",ylab="k",main="Castilla-La Mancha")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Castilla-La Mancha")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# CASTILLE AND LEON ---------------------------------------------------------
+data_CL = data[which(data$ccaa_iso == "CL"),]
+data_CL = data_CL[1:which(data_CL$fecha == "2020-07-23"),]
+
+cleon_22_june = sum(data_CL$num_casos_prueba_pcr[1:which(data_CL$fecha == "2020-06-23")])
+cleon_9_june = sum(data_CL$num_casos_prueba_pcr[1:which(data_CL$fecha == "2020-06-09")])
+cleon_22_july = sum(data_CL$num_casos_prueba_pcr[1:which(data_CL$fecha == "2020-07-23")])
+
+cleon_july = data.frame(matrix(ncol = 3, nrow = 8))
+colnames(cleon_july) = c("num_cases", "primary", "secondary")
+
+cleon_july$num_cases = as.integer(c(12,3,8,12,9,23,3,6))
+
+cleon_no_outbreaks = cleon_22_july - cleon_22_june - sum(cleon_july$num_cases)
+cleon_lockdown = cleon_22_june - cleon_9_june
+cleon_july$primary = as.integer(c(1,1,1,1,1,20,1,2))
+cleon_july$secondary = cleon_july$num_cases - cleon_july$primary
+cleon_july[9,1] = cleon_no_outbreaks + cleon_lockdown
+cleon_july[9,2] = cleon_lockdown
+cleon_july[9,3] = cleon_no_outbreaks
+
+isextinct=logical(length(cleon_july$num_cases))
+isextinct[c(1,2,5,6,7,8)] = TRUE
+icases=cleon_july$primary
+lcases=cleon_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1),type="l",xlab="Reff",ylab="k",main="Castille and Leon")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Castille and Leon")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# VALENCIAN COMMUNITY ----------------------------------------------------
+data_VC = data[which(data$ccaa_iso == "VC"),]
+data_VC = data_VC[1:which(data_VC$fecha == "2020-07-23"),]
+
+cvalencian_22_june = sum(data_VC$num_casos_prueba_pcr[1:which(data_VC$fecha == "2020-06-23")])
+cvalencian_9_june = sum(data_VC$num_casos_prueba_pcr[1:which(data_VC$fecha == "2020-06-09")])
+cvalencian_22_july = sum(data_VC$num_casos_prueba_pcr[1:which(data_VC$fecha == "2020-07-23")])
+
+cvalencian_july = data.frame(matrix(ncol = 3, nrow = 14))
+colnames(cvalencian_july) = c("num_cases", "primary", "secondary")
+
+cvalencian_july$num_cases = as.integer(c(28,4,4,4,84,4,4,7,3,4,6,3,3,19))
+
+cvalencian_no_outbreaks = cvalencian_22_july - cvalencian_22_june - sum(cvalencian_july$num_cases)
+cvalencian_lockdown = cvalencian_22_june - cvalencian_9_june
+cvalencian_july$primary = as.integer(c(11,4,4,4,10,4,1,7,3,3,3,3,1,3))
+cvalencian_july$secondary = cvalencian_july$num_cases - cvalencian_july$primary
+cvalencian_july[15,1] = cvalencian_no_outbreaks + cvalencian_lockdown
+cvalencian_july[15,2] = cvalencian_lockdown
+cvalencian_july[15,3] = cvalencian_no_outbreaks
+
+isextinct=logical(length(cvalencian_july$num_cases))
+isextinct[c(4,7,9,11,13,14)] = TRUE
+icases=cvalencian_july$primary
+lcases=cvalencian_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1),type="l",xlab="Reff",ylab="k",main="Valencian Community")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Valencian Community")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# BALEARIC ISLANDS ----------------------------------------------------------
+data_IB = data[which(data$ccaa_iso == "IB"),]
+data_IB = data_IB[1:which(data_IB$fecha == "2020-07-23"),]
+
+balearic_22_june = sum(data_IB$num_casos_prueba_pcr[1:which(data_IB$fecha == "2020-06-23")])
+balearic_9_june = sum(data_IB$num_casos_prueba_pcr[1:which(data_IB$fecha == "2020-06-09")])
+balearic_22_july = sum(data_IB$num_casos_prueba_pcr[1:which(data_IB$fecha == "2020-07-23")])
+
+balearic_july = data.frame(matrix(ncol = 3, nrow = 9))
+colnames(balearic_july) = c("num_cases", "primary", "secondary")
+
+balearic_july$num_cases = as.integer(c(8,3,3,4,7,4,3,6,9))
+
+balearic_no_outbreaks = balearic_22_july - balearic_22_june - sum(balearic_july$num_cases)
+balearic_lockdown = balearic_22_june - balearic_9_june
+balearic_july$primary = as.integer(c(5,3,1,3,7,4,3,6,1))
+balearic_july$secondary = balearic_july$num_cases - balearic_july$primary
+balearic_july[10,1] = balearic_no_outbreaks + balearic_lockdown
+balearic_july[10,2] = balearic_lockdown
+balearic_july[10,3] = balearic_no_outbreaks
+
+isextinct=logical(length(balearic_july$num_cases))
+isextinct[1:9] = TRUE
+icases=balearic_july$primary
+lcases=balearic_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="k",main="Balearic Islands")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.2),type="l",xlab="Reff",ylab="p80%",main="Balearic Islands")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# CANARY ISLANDS ----------------------------------------------------------------
+data_CN = data[which(data$ccaa_iso == "CN"),]
+data_CN = data_CN[1:which(data_CN$fecha == "2020-07-23"),]
+
+canary_22_june = sum(data_CN$num_casos_prueba_pcr[1:which(data_CN$fecha == "2020-06-23")])
+canary_9_june = sum(data_CN$num_casos_prueba_pcr[1:which(data_CN$fecha == "2020-06-09")])
+canary_22_july = sum(data_CN$num_casos_prueba_pcr[1:which(data_CN$fecha == "2020-07-23")])
+
+canary_july = data.frame(matrix(ncol = 3, nrow = 5))
+colnames(canary_july) = c("num_cases", "primary", "secondary")
+
+canary_july$num_cases = as.integer(c(4,10,12,3,3))
+
+canary_no_outbreaks = canary_22_july - canary_22_june - sum(canary_july$num_cases)
+canary_lockdown = canary_22_june - canary_9_june
+canary_july$primary = as.integer(c(1,10,1,1,3))
+canary_july$secondary = canary_july$num_cases - canary_july$primary
+canary_july[6,1] = canary_no_outbreaks + canary_lockdown
+canary_july[6,2] = canary_lockdown
+canary_july[6,3] = canary_no_outbreaks
+
+
+
+isextinct=logical(length(canary_july$num_cases))
+isextinct[1:5] = TRUE
+icases=canary_july$primary
+lcases=canary_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="k",main="Canary Islands")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Canary Islands")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# REGION OF MURCIA -----------------------------------------------------------------
+data_MC = data[which(data$ccaa_iso == "MC"),]
+data_MC = data_MC[1:which(data_MC$fecha == "2020-07-23"),]
+
+murcia_22_june = sum(data_MC$num_casos_prueba_pcr[1:which(data_MC$fecha == "2020-06-23")])
+murcia_9_june = sum(data_MC$num_casos_prueba_pcr[1:which(data_MC$fecha == "2020-06-09")])
+murcia_22_july = sum(data_MC$num_casos_prueba_pcr[1:which(data_MC$fecha == "2020-07-23")])
+
+murcia_july = data.frame(matrix(ncol = 3, nrow = 6))
+colnames(murcia_july) = c("num_cases", "primary", "secondary")
+
+murcia_july$num_cases = as.integer(c(150,7,4,82,5,6))
+
+murcia_no_outbreaks = murcia_22_july - murcia_22_june - sum(murcia_july$num_cases)
+murcia_lockdown = murcia_22_june - murcia_9_june
+murcia_july$primary = as.integer(c(2,1,1,1,1,1))
+murcia_july$secondary = murcia_july$num_cases - murcia_july$primary
+murcia_july[7,1] = murcia_no_outbreaks + murcia_lockdown
+murcia_july[7,2] = murcia_lockdown
+murcia_july[7,3] = murcia_no_outbreaks
+
+
+
+isextinct=logical(length(murcia_july$num_cases))
+isextinct[2:6] = TRUE
+icases=murcia_july$primary
+lcases=murcia_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1.5),type="l",xlab="Reff",ylab="k",main="Region of Murcia")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="Reff",ylab="p80%",main="Region of Murcia")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# COMMUNITY OF MADRID -----------------------------------------------------
+data_MD = data[which(data$ccaa_iso == "MD"),]
+data_MD = data_MD[1:which(data_MD$fecha == "2020-07-23"),]
+
+madrid_22_june = sum(data_MD$num_casos_prueba_pcr[1:which(data_MD$fecha == "2020-06-23")])
+madrid_9_june = sum(data_MD$num_casos_prueba_pcr[1:which(data_MD$fecha == "2020-06-09")])
+madrid_22_july = sum(data_MD$num_casos_prueba_pcr[1:which(data_MD$fecha == "2020-07-23")])
+
+madrid_july = data.frame(matrix(ncol = 3, nrow = 7))
+colnames(madrid_july) = c("num_cases", "primary", "secondary")
+
+madrid_july$num_cases = as.integer(c(5,7,7,7,16,5,4))
+
+madrid_no_outbreaks = madrid_22_july - madrid_22_june - sum(madrid_july$num_cases)
+madrid_lockdown = madrid_22_june - madrid_9_june
+madrid_july$primary = as.integer(c(5,7,5,7,1,5,4))
+madrid_july$secondary = madrid_july$num_cases - madrid_july$primary
+madrid_july[8,1] = madrid_no_outbreaks + madrid_lockdown
+madrid_july[8,2] = madrid_lockdown
+madrid_july[8,3] = madrid_no_outbreaks
+
+
+
+isextinct=logical(length(madrid_july$num_cases))
+icases=madrid_july$primary
+lcases=madrid_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,10),type="l",xlab="Reff",ylab="k",main="Community of Madrid")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1),type="l",xlab="Reff",ylab="p80%",main="Community of Madrid")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+# SPAIN -------------------------------------------------------------------
+
+spain_july = rbind(andalusia_july, extremadura_july, rioja_july, cantabria_july, basquecountry_july,
+      galicia_july, cmancha_july, cleon_july, cvalencian_july, balearic_july,
+      canary_july, murcia_july)
+
+isextinct=logical(length(spain_july$num_cases))
+isextinct[c(1:5,7:32,35:38,41,44,46:47,49:51,54:58,60,62,64,66,68,70,71,74:77,
+            82,85,87,89,91,92,94:102,104:108,111:115)] = TRUE
+icases=spain_july$primary
+lcases=spain_july$secondary
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("Reff","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.3),type="l",xlab="Reff",ylab="k",main="SPAIN")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.3),type="l",xlab="Reff",ylab="p80%",main="SPAIN")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(1.5,2,length.out=3),seq(2,1.5,length.out=3)),y=c(cri[1,6:8],cri[2,8:6]),lty=0,col=rgb(0,0,1,0.1))
+med
+cri
+
+
+# Initial phase of COVID-19 pandemic -----------------------------------------------
+my_data_4_3 = data[(which(data$fecha=="2020-03-04")),]
+my_data_4_3 = my_data_4_3[,c(1,3)]
+my_data_4_3$num_casos_reales = as.integer(c(12,1,3,0,0,9,11,7,28,6,0,4,0,29,0,2,12,0,21))
+
+# exclude those with 0 cases: CE, MC and ML
+my_data_4_3 = my_data_4_3[-c(which(my_data_4_3$num_casos_reales==0)),]
+
+# imported cases
+my_data_4_3$imported = as.integer(c(4,1,2,8,4,3,14,6,4,6,1,3,11))
+my_data_4_3$local = my_data_4_3$num_casos_reales - my_data_4_3$imported
+
+
+
+isextinct=logical(length(my_data_4_3$num_casos_reales))
+isextinct[1:5] = TRUE
+icases=my_data_4_3$imported
+lcases=my_data_4_3$local
+
+
+## Results
+### Overdispersion parameter
+
+# MCMC
+Data=list(N=13,mon.names=c("R0","k"),parm.names="invk",R0=1,icases=icases,lcases=lcases,isextinct=isextinct)
+Model=function(parm,Data){
+  invk=interval(parm,0)
+  lp=lltotal_R0(invk,Data$icases,Data$lcases,Data$isextinct,Data$R0)
+  lp=lp+dnorm(invk,0,10,log=T)
+  return(list(LP=lp,Dev=-2*lp,Monitor=c(Data$R0,1/invk),yhat=NULL,parm=invk))
+}
+R0s=1:20/4
+niter=10000
+set.seed(19)
+mcmcfits=lapply(R0s,function(R0){
+  Data$R0=R0
+  fit=LaplacesDemon(Model=Model,Data=Data,Initial.Values=50,Covar=NULL,Iterations=niter,Status=niter,Thinning=10,Algorithm='HARM',Specs=list(alpha.star=0.2,B=NULL))
+})
+k_mcmc=sapply(mcmcfits,function(x){x$Monitor[(niter%/%20):(niter%/%10),2]})
+ll_mcmc=sapply(mcmcfits,function(x){-x$Deviance[(niter%/%20):(niter%/%10)]/2})          
+
+
+# Plot
+med=apply(k_mcmc,2,median)
+cri=apply(k_mcmc,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,1),type="l",xlab="R0",ylab="k",main="Spain (early phase of COVID-19)")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(2,3,length.out=5),seq(3,2,length.out=5)),y=c(cri[1,8:12],cri[2,12:8]),lty=0,col=rgb(1,0,0,0.1))
+med
+cri
+
+### Proportion responsible for 80% of transmissions
+
+# Calculate proportion responsible for 80% of total transmissions
+props=sapply(1:length(R0s),function(R0id)sapply(k_mcmc[,R0id],function(k_)propresponsible(R0s[R0id],k_,0.8)))
+med=apply(props,2,median)
+cri=apply(props,2,function(x){quantile(x,c(0.025,0.975))})
+plot(x=R0s,y=med,xlim=c(0,5),ylim=c(0,0.5),type="l",xlab="R0",ylab="p80%",main="Spain (early phase of COVID-19)")
+polygon(x=c(R0s,rev(R0s)),y=c(cri[1,],rev(cri[2,])),lty=0,col=rgb(0,0,0,0.1))
+polygon(x=c(seq(2,3,length.out=5),seq(3,2,length.out=5)),y=c(cri[1,8:12],cri[2,12:8]),lty=0,col=rgb(0,0,1,0.1))
+
+
+
